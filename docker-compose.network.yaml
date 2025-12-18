@@ -1,0 +1,6 @@
+version: '3.8'
+
+networks:
+  shared_infra:
+    name: shared_infra_net
+    external: true
