@@ -8,3 +8,12 @@ services:
       - "2222:22"
     restart: unless-stopped
     tty: true
+    networks:
+      shared_infra:
+        aliases:
+          - ubuntu-ssh
+
+networks:
+  shared_infra:
+    external: true
+    name: shared_infra_net
