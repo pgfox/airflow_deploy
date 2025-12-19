@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  db-setup:
+    image: postgres:15
+    container_name: db_setup_runner
+    working_dir: /db_setup
+    entrypoint: ["/bin/bash", "/db_setup/run_all.sh"]
+    environment:
+      PGHOST: postgres-db
+      PGPORT: 5432
+      PGUSER: airflow
+      PGPASSWORD: airflow
+      MAINTENANCE_DB: postgres
+      APP_DB: my_db_1
+    volumes:
+      - ./:/db_setup
+    networks:
+      shared_infra:
+        aliases:
+          - db-setup
+
+networks:
+  shared_infra:
+    external: true
+    name: shared_infra_net
