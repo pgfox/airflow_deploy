@@ -12,6 +12,7 @@ Minimal Apache Airflow 2.9 deployment that connects to the shared `postgres_db` 
 
 - `docker-compose.yaml` – defines webserver + scheduler using `LocalExecutor`
 - `dags/`, `logs/`, `plugins/` – bind-mounted into the containers
+- `data_vol` – named Docker volume mounted at `/opt/airflow/data` for temporary SFTP downloads
 - `.env` – sets `AIRFLOW_UID/GID` for file permissions
 
 ## Usage
@@ -33,5 +34,6 @@ The Airflow UI listens on http://localhost:8090 with `admin/admin`. Logs and DAG
 ## Notes
 
 - Update `docker-compose.yaml` if you want to change the Postgres credentials or host/port.
+- The `data_vol` volume holds temporary data fetched from SFTP; remove it with `docker volume rm airflow_2.9_data_vol` when you want a clean slate.
 - Because the database lives outside this stack, shut down Airflow with `docker compose down` without affecting the main Postgres container.
 - `dags/sample_dag.py` contains a trivial DAG you can enable to verify the deployment.

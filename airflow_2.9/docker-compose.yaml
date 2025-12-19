@@ -14,6 +14,7 @@ x-airflow-common: &airflow-common
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - data_vol:/opt/airflow/data
   user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
   networks:
     - shared_infra
@@ -54,3 +55,6 @@ networks:
   shared_infra:
     external: true
     name: shared_infra_net
+
+volumes:
+  data_vol:
