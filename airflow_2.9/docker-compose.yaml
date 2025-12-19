@@ -10,6 +10,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-sftp
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -20,6 +21,16 @@ x-airflow-common: &airflow-common
     - shared_infra
 
 services:
+  data-permissions:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - chown -R ${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0} /opt/airflow/data
+    # profiles:
+    #   - setup
+
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -43,12 +54,16 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+      data-permissions:
+        condition: service_completed_successfully
 
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
     depends_on:
       airflow-init:
+        condition: service_completed_successfully
+      data-permissions:
         condition: service_completed_successfully
 
 networks:

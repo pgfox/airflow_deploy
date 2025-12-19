@@ -35,5 +35,27 @@ The Airflow UI listens on http://localhost:8090 with `admin/admin`. Logs and DAG
 
 - Update `docker-compose.yaml` if you want to change the Postgres credentials or host/port.
 - The `data_vol` volume holds temporary data fetched from SFTP; remove it with `docker volume rm airflow_2.9_data_vol` when you want a clean slate.
+- If you hit permission issues writing to `/opt/airflow/data`, run `docker compose run --rm data-permissions` once to chown the volume to the Airflow user. (it should run automatically now)
 - Because the database lives outside this stack, shut down Airflow with `docker compose down` without affecting the main Postgres container.
 - `dags/sample_dag.py` contains a trivial DAG you can enable to verify the deployment.
+- `dags/fetch_sftp_csv.py` downloads `.csv` files from `sftp_con` into `/opt/airflow/data/sftp_downloads`.
+
+### Configure the SFTP connection
+
+The DAG expects an Airflow connection named `sftp_default` that points to the `sftp_con` service. Create it via the UI or CLI:
+
+```bash
+docker compose run --rm airflow-webserver \
+  airflow connections add sftp_default \
+    --conn-uri sftp://ubuntu:ubuntu@sftp-server:22
+```
+
+### Run the `fetch_sftp_csv` DAG manually
+
+```bash
+# Trigger once (scheduler/webserver should already be running)
+docker compose run --rm airflow-webserver \
+  airflow dags trigger fetch_sftp_csv
+```
+
+The task copies any `.csv` file from `/home/ubuntu/upload` on the SFTP server into the shared volume under `data/sftp_downloads/` on the host.
