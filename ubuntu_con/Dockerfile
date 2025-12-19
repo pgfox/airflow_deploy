@@ -3,7 +3,10 @@ FROM ubuntu:22.04
 # Install OpenSSH server and sudo for convenience
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        iputils-ping \
+        netcat-openbsd \
         openssh-server \
+        postgresql-client \
         sudo \
     && rm -rf /var/lib/apt/lists/*
 

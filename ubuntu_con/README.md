@@ -29,4 +29,5 @@ You will land in a regular shell with password-based login enabled. The `ubuntu`
 
 - Change the password immediately for anything beyond local testing (`passwd`).
 - Adjust the exposed port in `docker-compose.yaml` if `2222` conflicts with another service.
+- Includes the `psql` client (`postgresql-client`) so you can reach the shared Postgres instance directly.
 - Extend the `Dockerfile` with additional packages or SSH keys as needed.
