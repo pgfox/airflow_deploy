@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  sftp:
+    image: atmoz/sftp:latest
+    container_name: sftp_server
+    command: ubuntu:ubuntu:1001:::upload
+    ports:
+      - "2299:22"
+    volumes:
+      - ./data:/home/ubuntu/upload
+    restart: unless-stopped
+    networks:
+      shared_infra:
+        aliases:
+          - sftp-server
+
+networks:
+  shared_infra:
+    external: true
+    name: shared_infra_net
