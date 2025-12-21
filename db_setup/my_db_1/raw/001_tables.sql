@@ -4,3 +4,15 @@ CREATE TABLE IF NOT EXISTS raw.ingest_queue (
     payload JSONB NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Orders ingested from SFTP CSV files
+CREATE TABLE IF NOT EXISTS raw.orders (
+    customer_name TEXT,
+    address TEXT,
+    product_name TEXT,
+    product_id TEXT,
+    quantity INTEGER,
+    purchase_date DATE,
+    invoice_id TEXT,
+    product_cost NUMERIC(12,2)
+);
