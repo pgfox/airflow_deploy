@@ -27,6 +27,8 @@ psql_maint -f my_db_1/00_database.sql
 
 echo "Configuring schemas/tables inside ${APP_DB}"
 psql_app -f my_db_1/10_schemas.sql
+psql_app -f my_db_1/metadata/001_tables.sql
+psql_app -f my_db_1/metadata/010_indexes.sql
 psql_app -f my_db_1/raw/001_tables.sql
 psql_app -f my_db_1/raw/010_indexes.sql
 psql_app -f my_db_1/stage/001_tables.sql
