@@ -60,6 +60,8 @@ docker compose run --rm airflow-webserver \
     --conn-uri postgresql://airflow:airflow@postgres-db:5432/airflow
 ```
 
+Alternatively, the compose file sets `AIRFLOW_CONN_POSTGRES_DB` so the connection `postgres_db` is auto-created from the environment. Match the DAG’s `POSTGRES_CONN_ID` (default `postgres_db`) or override `POSTGRES_CONN_ID` via environment if you prefer a different connection name.
+
 ### Run the `fetch_sftp_csv` DAG manually
 
 ```bash
