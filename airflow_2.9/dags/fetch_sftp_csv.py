@@ -1,36 +1,160 @@
 from __future__ import annotations
 
 import os
-import csv
+import socket
 from datetime import datetime
+from pathlib import Path
+from typing import Dict
 
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
-from airflow.providers.sftp.hooks.sftp import SFTPHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.sftp.hooks.sftp import SFTPHook
 
-REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/upload")
-LOCAL_BASE = "/opt/airflow/data/sftp_downloads"
+# Configuration
+REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/home/ubuntu/upload")
+LOCAL_BASE = Path("/opt/airflow/data/landing")
 SFTP_CONN_ID = os.environ.get("SFTP_CONN_ID", "sftp_default")
 POSTGRES_CONN_ID = os.environ.get("POSTGRES_CONN_ID", "postgres_db")
-TARGET_TABLE = "raw.orders"
-EXPECTED_HEADERS = [
-    "customer_name",
-    "address",
-    "product_name",
-    "product_id",
-    "quantity",
-    "purchase_date",
-    "invoice_id",
-    "product_cost",
-]
+BATCH_TABLE = "metadata.batches"
+STAGE_TABLE = "stage.orders_raw"
+ALLOWED_SUFFIX = ".csv"
 
 
-def load_csv_to_postgres(path: str) -> None:
-    """Load a CSV file into raw.orders using COPY."""
-    pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+def _get_pg_hook() -> PostgresHook:
+    return PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+
+def discover_sftp_files(**context) -> None:
+    """List remote CSVs and register them in metadata.batches as status=new."""
+    hook = SFTPHook(ftp_conn_id=SFTP_CONN_ID)
+    client = hook.get_conn()
+    remote_dir = REMOTE_DIR.rstrip("/")
+    entries = hook.list_directory(remote_dir)
+
+    rows = []
+    for entry in entries:
+        if entry in {".", ".."} or not entry.lower().endswith(ALLOWED_SUFFIX):
+            continue
+        remote_path = f"{remote_dir}/{entry}"
+        stat = client.stat(remote_path)
+        rows.append(
+            {
+                "remote_path": remote_path,
+                "file_name": entry,
+                "file_size": stat.st_size,
+                "file_mtime": datetime.fromtimestamp(stat.st_mtime),
+            }
+        )
+
+    if not rows:
+        return
+
+    insert_sql = f"""
+    INSERT INTO {BATCH_TABLE} (remote_path, file_name, file_size, file_mtime, status)
+    VALUES (%(remote_path)s, %(file_name)s, %(file_size)s, %(file_mtime)s, 'new')
+    ON CONFLICT (remote_path) DO NOTHING;
+    """
+    pg_hook = _get_pg_hook()
+    conn = pg_hook.get_conn()
+    with conn, conn.cursor() as cur:
+        cur.executemany(insert_sql, rows)
+    conn.commit()
+
+
+def claim_batch(**context) -> Dict[str, str]:
+    """Atomically claim one new batch using SKIP LOCKED."""
+    pg_hook = _get_pg_hook()
+    hostname = socket.gethostname()
+    dag_id = context["dag"].dag_id
+    run_id = context["run_id"]
+
+    sql = f"""
+    WITH c AS (
+        SELECT batch_id
+        FROM {BATCH_TABLE}
+        WHERE status = 'new'
+        ORDER BY created_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    )
+    UPDATE {BATCH_TABLE} b
+    SET status = 'ingesting',
+        claimed_at = now(),
+        claimed_by = %s,
+        attempt = COALESCE(attempt, 0) + 1,
+        dag_id = %s,
+        run_id = %s
+    FROM c
+    WHERE b.batch_id = c.batch_id
+    RETURNING b.batch_id, b.remote_path, b.file_name;
+    """
+    conn = pg_hook.get_conn()
+    with conn, conn.cursor() as cur:
+        cur.execute(sql, (hostname, dag_id, run_id))
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise AirflowSkipException("No batches available to claim.")
+
+    batch_id, remote_path, file_name = row
+    return {
+        "batch_id": batch_id,
+        "remote_path": remote_path,
+        "file_name": file_name,
+    }
+
+
+def download_claimed_batch(ti, **context) -> Dict[str, str]:
+    """Download the claimed file to the landing directory and persist local_path."""
+    batch = ti.xcom_pull(task_ids="claim_batch")
+    if not batch:
+        raise AirflowSkipException("No batch claimed; skipping download.")
+
+    LOCAL_BASE.mkdir(parents=True, exist_ok=True)
+    local_path = LOCAL_BASE / f"{batch['batch_id']}__{batch['file_name']}"
+
+    sftp_hook = SFTPHook(ftp_conn_id=SFTP_CONN_ID)
+    sftp_hook.retrieve_file(batch["remote_path"], str(local_path))
+
+    pg_hook = _get_pg_hook()
+    update_sql = f"""
+    UPDATE {BATCH_TABLE}
+    SET local_path = %s
+    WHERE batch_id = %s
+    """
+    pg_hook.run(update_sql, parameters=(str(local_path), batch["batch_id"]))
+
+    batch["local_path"] = str(local_path)
+    return batch
+
+
+def load_to_postgres(ti, **context) -> Dict[str, str]:
+    """Load the downloaded CSV into a staging table using COPY."""
+    batch = ti.xcom_pull(task_ids="download_claimed_batch")
+    if not batch or "local_path" not in batch:
+        raise AirflowSkipException("No local file found for load.")
+
+    pg_hook = _get_pg_hook()
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS stage;
+    CREATE TABLE IF NOT EXISTS {STAGE_TABLE} (
+        customer_name TEXT,
+        address TEXT,
+        product_name TEXT,
+        product_id TEXT,
+        quantity INTEGER,
+        purchase_date DATE,
+        invoice_id TEXT,
+        product_cost NUMERIC(12,2)
+    );
+    """
+    pg_hook.run(ddl)
+
     copy_sql = f"""
-    COPY {TARGET_TABLE} (
+    COPY {STAGE_TABLE} (
         customer_name,
         address,
         product_name,
@@ -42,52 +166,70 @@ def load_csv_to_postgres(path: str) -> None:
     )
     FROM STDIN WITH CSV HEADER
     """
-    pg_hook.copy_expert(sql=copy_sql, filename=path)
+    pg_hook.copy_expert(sql=copy_sql, filename=batch["local_path"])
+
+    return batch
 
 
-def is_order_csv(path: str) -> bool:
-    """Return True if the file header matches the expected order schema."""
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, [])
-    normalized = [h.strip() for h in header]
-    return normalized == EXPECTED_HEADERS
+def mark_ingested(ti, **context) -> None:
+    batch = ti.xcom_pull(task_ids="load_to_postgres")
+    if not batch:
+        raise AirflowSkipException("No batch to mark ingested.")
+    pg_hook = _get_pg_hook()
+    pg_hook.run(
+        f"UPDATE {BATCH_TABLE} SET status='ingested', ingested_at=now() WHERE batch_id = %s",
+        parameters=(batch["batch_id"],),
+    )
 
 
-def download_csv_files(**context):
-    """Fetch CSV files from SFTP, store locally, then load into Postgres raw.orders."""
-    sftp_hook = SFTPHook(ftp_conn_id=SFTP_CONN_ID)
-    os.makedirs(LOCAL_BASE, exist_ok=True)
-
-    remote_dir = REMOTE_DIR.rstrip("/")
-    entries = sftp_hook.list_directory(remote_dir)
-
-    for entry in entries:
-        if entry in {".", ".."}:
-            continue
-        if not entry.lower().endswith(".csv"):
-            continue
-        if not entry.startswith("order_"):
-            # Skip CSVs that are not order files to avoid schema mismatches
-            continue
-
-        remote_path = f"{remote_dir}/{entry}"
-        local_path = os.path.join(LOCAL_BASE, entry)
-        sftp_hook.retrieve_file(remote_full_path=remote_path, local_full_path=local_path)
-        if not is_order_csv(local_path):
-            continue
-        load_csv_to_postgres(local_path)
+def process_batch(ti, **context) -> None:
+    """Placeholder transform/DQ step; marks batch done."""
+    batch = ti.xcom_pull(task_ids="load_to_postgres")
+    if not batch:
+        raise AirflowSkipException("No batch to process.")
+    pg_hook = _get_pg_hook()
+    pg_hook.run(
+        f"UPDATE {BATCH_TABLE} SET status='done', completed_at=now() WHERE batch_id = %s",
+        parameters=(batch["batch_id"],),
+    )
 
 
 with DAG(
     dag_id="fetch_sftp_csv",
-    description="Download CSV files from sftp_con and load them into raw.orders.",
-    schedule_interval=None,  # manual execution
+    description="Discover, claim, download, and load exactly one SFTP CSV batch per run.",
+    schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["sftp", "ingest"],
 ) as dag:
-    PythonOperator(
-        task_id="download_csv",
-        python_callable=download_csv_files,
+    discover = PythonOperator(
+        task_id="discover_sftp_files",
+        python_callable=discover_sftp_files,
     )
+
+    claim = PythonOperator(
+        task_id="claim_batch",
+        python_callable=claim_batch,
+    )
+
+    download = PythonOperator(
+        task_id="download_claimed_batch",
+        python_callable=download_claimed_batch,
+    )
+
+    load = PythonOperator(
+        task_id="load_to_postgres",
+        python_callable=load_to_postgres,
+    )
+
+    mark = PythonOperator(
+        task_id="mark_ingested",
+        python_callable=mark_ingested,
+    )
+
+    process = PythonOperator(
+        task_id="process_batch",
+        python_callable=process_batch,
+    )
+
+    discover >> claim >> download >> load >> mark >> process
