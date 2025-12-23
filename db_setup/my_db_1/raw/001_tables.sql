@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS raw.ingest_queue (
 
 -- Orders ingested from SFTP CSV files
 CREATE TABLE IF NOT EXISTS raw.orders (
+    batch_id BIGINT,
     customer_name TEXT,
     address TEXT,
     product_name TEXT,

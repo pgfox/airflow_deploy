@@ -13,12 +13,14 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.sftp.hooks.sftp import SFTPHook
 
 # Configuration
-REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/upload")
+REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "upload")
 LOCAL_BASE = Path("/opt/airflow/data/landing")
 SFTP_CONN_ID = os.environ.get("SFTP_CONN_ID", "sftp_default")
 POSTGRES_CONN_ID = os.environ.get("POSTGRES_CONN_ID", "postgres_db")
 BATCH_TABLE = "metadata.batches"
 RAW_TABLE = "raw.orders"
+CLEAN_TABLE = "stage.orders_clean"
+QUAR_TABLE = "dq.quarantine_orders"
 ALLOWED_SUFFIX = ".csv"
 
 
@@ -141,20 +143,22 @@ def load_to_postgres(ti, **context) -> Dict[str, str]:
         raise AirflowSkipException("No local file found for load.")
 
     pg_hook = _get_pg_hook()
-    # ddl = f"""
-    # CREATE SCHEMA IF NOT EXISTS stage;
-    # CREATE TABLE IF NOT EXISTS {RAW_TABLE} (
-    #     customer_name TEXT,
-    #     address TEXT,
-    #     product_name TEXT,
-    #     product_id TEXT,
-    #     quantity INTEGER,
-    #     purchase_date DATE,
-    #     invoice_id TEXT,
-    #     product_cost NUMERIC(12,2)
-    # );
-    # """
-    # pg_hook.run(ddl)
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS raw;
+    CREATE TABLE IF NOT EXISTS {RAW_TABLE} (
+        batch_id BIGINT,
+        customer_name TEXT,
+        address TEXT,
+        product_name TEXT,
+        product_id TEXT,
+        quantity INTEGER,
+        purchase_date DATE,
+        invoice_id TEXT,
+        product_cost NUMERIC(12,2)
+    );
+    """
+    pg_hook.run(ddl)
+    pg_hook.run(f"TRUNCATE TABLE {RAW_TABLE};")
 
     copy_sql = f"""
     COPY {RAW_TABLE} (
@@ -170,6 +174,7 @@ def load_to_postgres(ti, **context) -> Dict[str, str]:
     FROM STDIN WITH CSV HEADER
     """
     pg_hook.copy_expert(sql=copy_sql, filename=batch["local_path"])
+    pg_hook.run(f"UPDATE {RAW_TABLE} SET batch_id = %s", parameters=(batch["batch_id"],))
 
     return batch
 
@@ -183,6 +188,71 @@ def mark_ingested(ti, **context) -> None:
         f"UPDATE {BATCH_TABLE} SET status='ingested', ingested_at=now() WHERE batch_id = %s",
         parameters=(batch["batch_id"],),
     )
+
+def dq_batch(ti, **context) -> None:
+    """DQ split: good rows to stage.orders_clean, bad rows to dq.quarantine_orders."""
+    batch = ti.xcom_pull(task_ids="load_to_postgres")
+    if not batch:
+        raise AirflowSkipException("No batch to DQ.")
+    
+    batch_id = batch["batch_id"]
+
+    condition = """
+        quantity IS NOT NULL AND quantity > 1 AND quantity < 1000
+        AND customer_name IS NOT NULL AND btrim(customer_name) <> ''
+        AND address IS NOT NULL AND btrim(address) <> ''
+        AND product_id IS NOT NULL AND btrim(product_id) <> ''
+        AND purchase_date IS NOT NULL AND purchase_date >= DATE '2024-01-01'
+        AND product_cost IS NOT NULL AND product_cost > 0
+    """
+
+    pg_hook = _get_pg_hook()
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS stage;
+    CREATE SCHEMA IF NOT EXISTS dq;
+    CREATE TABLE IF NOT EXISTS {CLEAN_TABLE} (LIKE {RAW_TABLE} INCLUDING ALL);
+    CREATE TABLE IF NOT EXISTS {QUAR_TABLE} (
+        batch_id BIGINT,
+        payload JSONB,
+        error_code TEXT,
+        error_detail TEXT,
+        dag_id TEXT,
+        run_id TEXT,
+        quarantined_at TIMESTAMPTZ DEFAULT now()
+    );
+    """
+    pg_hook.run(ddl)
+
+    # Clear any previous rows for this batch
+    pg_hook.run(f"DELETE FROM {CLEAN_TABLE} WHERE batch_id = %s", parameters=(batch_id,))
+    pg_hook.run(f"DELETE FROM {QUAR_TABLE} WHERE batch_id = %s", parameters=(batch_id,))
+
+    pg_hook.run(
+        f"""
+        INSERT INTO {CLEAN_TABLE}
+        SELECT *
+        FROM {RAW_TABLE}
+        WHERE batch_id = %s AND {condition}
+        """,
+        parameters=(batch_id,),
+    )
+
+    pg_hook.run(
+        f"""
+        INSERT INTO {QUAR_TABLE} (batch_id, payload, error_code, error_detail, dag_id, run_id)
+        SELECT
+            %s,
+            to_jsonb(r.*),
+            'DQ_VALIDATION_FAILED',
+            'Failed validation rules',
+            %s,
+            %s
+        FROM {RAW_TABLE} r
+        WHERE batch_id = %s AND NOT ({condition})
+        """,
+        parameters=(batch_id, context["dag"].dag_id, context["run_id"], batch_id),
+    )
+
 
 
 def process_batch(ti, **context) -> None:
@@ -230,9 +300,14 @@ with DAG(
         python_callable=mark_ingested,
     )
 
+    dq = PythonOperator(
+        task_id="dq_batch",
+        python_callable=dq_batch,
+    )
+
     process = PythonOperator(
         task_id="process_batch",
         python_callable=process_batch,
     )
 
-    discover >> claim >> download >> load >> mark >> process
+    discover >> claim >> download >> load >> mark >> dq >> process 
