@@ -13,12 +13,12 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.sftp.hooks.sftp import SFTPHook
 
 # Configuration
-REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/home/ubuntu/upload")
+REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/upload")
 LOCAL_BASE = Path("/opt/airflow/data/landing")
 SFTP_CONN_ID = os.environ.get("SFTP_CONN_ID", "sftp_default")
 POSTGRES_CONN_ID = os.environ.get("POSTGRES_CONN_ID", "postgres_db")
 BATCH_TABLE = "metadata.batches"
-STAGE_TABLE = "stage.orders_raw"
+RAW_TABLE = "raw.orders"
 ALLOWED_SUFFIX = ".csv"
 
 
@@ -35,7 +35,10 @@ def discover_sftp_files(**context) -> None:
 
     rows = []
     for entry in entries:
-        if entry in {".", ".."} or not entry.lower().endswith(ALLOWED_SUFFIX):
+        if entry in {".", ".."}:
+            continue
+        name = entry.lower()
+        if not (name.startswith("order_") and name.endswith(ALLOWED_SUFFIX)):
             continue
         remote_path = f"{remote_dir}/{entry}"
         stat = client.stat(remote_path)
@@ -138,23 +141,23 @@ def load_to_postgres(ti, **context) -> Dict[str, str]:
         raise AirflowSkipException("No local file found for load.")
 
     pg_hook = _get_pg_hook()
-    ddl = f"""
-    CREATE SCHEMA IF NOT EXISTS stage;
-    CREATE TABLE IF NOT EXISTS {STAGE_TABLE} (
-        customer_name TEXT,
-        address TEXT,
-        product_name TEXT,
-        product_id TEXT,
-        quantity INTEGER,
-        purchase_date DATE,
-        invoice_id TEXT,
-        product_cost NUMERIC(12,2)
-    );
-    """
-    pg_hook.run(ddl)
+    # ddl = f"""
+    # CREATE SCHEMA IF NOT EXISTS stage;
+    # CREATE TABLE IF NOT EXISTS {RAW_TABLE} (
+    #     customer_name TEXT,
+    #     address TEXT,
+    #     product_name TEXT,
+    #     product_id TEXT,
+    #     quantity INTEGER,
+    #     purchase_date DATE,
+    #     invoice_id TEXT,
+    #     product_cost NUMERIC(12,2)
+    # );
+    # """
+    # pg_hook.run(ddl)
 
     copy_sql = f"""
-    COPY {STAGE_TABLE} (
+    COPY {RAW_TABLE} (
         customer_name,
         address,
         product_name,
